@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: 저장소 가져오기
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 디스크 공간 확보
         run: |
@@ -28,14 +30,32 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
-      - name: 프로젝트 압축 풀기
+      - name: 프로젝트 압축 풀기 (zip 이 여러 개면 가장 최근에 올린 것 사용)
+        shell: bash
         run: |
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1)
-          if [ -z "$ZIP" ]; then echo "::error::저장소 최상위에 codeos.zip 이 없습니다. zip 파일을 그대로 업로드하세요."; exit 1; fi
-          mkdir -p "$RUNNER_TEMP/unz" && unzip -q "$ZIP" -d "$RUNNER_TEMP/unz"
+          best=""; bestt=-1
+          while IFS= read -r z; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true); t=${t:-0}
+            echo "zip 후보: '$z' (올린 시각 $(date -d @"$t" '+%F %T' 2>/dev/null || echo "$t"))"
+            if [ "$t" -ge "$bestt" ]; then best="$z"; bestt=$t; fi
+          done < <(find . -maxdepth 1 -name '*.zip' -printf '%P\n' | sort)
+          if [ -z "$best" ]; then
+            echo "::error::저장소 최상위에 zip 파일이 없습니다. codeos.zip 을 압축 풀지 말고 그대로 업로드하세요."; exit 1
+          fi
+          echo "사용할 zip: '$best'"
+          mkdir -p "$RUNNER_TEMP/unz" && unzip -q "$best" -d "$RUNNER_TEMP/unz"
           CFG=$(find "$RUNNER_TEMP/unz" -maxdepth 3 -path '*/auto/config' | head -n1)
-          if [ -z "$CFG" ]; then echo "::error::zip 안에서 auto/config 를 찾지 못했습니다."; exit 1; fi
-          echo "PROJ=$(dirname "$(dirname "$CFG")")" >> "$GITHUB_ENV"
+          if [ -z "$CFG" ]; then echo "::error::zip 안에서 auto/config 를 찾지 못했습니다. 압축을 풀지 않은 codeos.zip 이 맞는지 확인하세요."; exit 1; fi
+          PROJ=$(dirname "$(dirname "$CFG")")
+          echo "프로젝트 버전:"; cat "$PROJ/VERSION.txt" 2>/dev/null || echo "(VERSION.txt 없음 — 옛날 zip)"
+          if [ ! -f "$PROJ/ci/run-ci.sh" ]; then
+            echo "::error::저장소의 zip('$best')이 옛날 버전입니다 (ci/run-ci.sh 없음)."
+            echo "::error::해결: 저장소에서 옛날 zip 을 삭제(휴지통 아이콘)하고, 채팅에서 받은 최신 codeos.zip 을 다시 업로드한 뒤 Run workflow."
+            echo "## ❌ 저장소의 zip 이 옛날 버전입니다
+          옛날 zip 파일을 삭제하고 최신 \`codeos.zip\` 을 다시 업로드하세요. (사용된 zip: \`$best\`)" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          fi
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
 
       - name: ISO 빌드 및 업로드 (60~120분)
         env:
