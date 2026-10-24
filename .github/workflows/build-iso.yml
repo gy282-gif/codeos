@@ -1,0 +1,98 @@
+name: Build CodeOS ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      no_backports:
+        description: "최신 커널(backports) 없이 빌드 — 빌드가 backports 때문에 실패했을 때만 체크"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      NO_BACKPORTS: ${{ inputs.no_backports && '1' || '0' }}
+    steps:
+      - name: 저장소 가져오기
+        uses: actions/checkout@v4
+
+      - name: 디스크 공간 확보
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: 프로젝트 압축 풀기
+        run: |
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1)
+          if [ -z "$ZIP" ]; then echo "::error::저장소 최상위에 codeos.zip 이 없습니다. zip 파일을 그대로 업로드하세요."; exit 1; fi
+          echo "압축 파일: $ZIP"
+          mkdir -p "$RUNNER_TEMP/unz" && unzip -q "$ZIP" -d "$RUNNER_TEMP/unz"
+          CFG=$(find "$RUNNER_TEMP/unz" -maxdepth 3 -path '*/auto/config' | head -n1)
+          if [ -z "$CFG" ]; then echo "::error::zip 안에서 auto/config 를 찾지 못했습니다."; exit 1; fi
+          PROJ=$(dirname "$(dirname "$CFG")")
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+          ls "$PROJ"
+
+      - name: ISO 빌드 (Debian live-build, 60~120분)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          docker run --rm --privileged -e NO_BACKPORTS="$NO_BACKPORTS" \
+            -v "$PROJ":/src:ro -v "$GITHUB_WORKSPACE/out":/out \
+            debian:bookworm bash -c "tr -d '\r' < /src/docker-build-inner.sh > /tmp/inner.sh && bash /tmp/inner.sh"
+          ls -lh out
+
+      - name: 실패 시 로그 요약
+        if: failure()
+        run: |
+          if [ -f out/build.log ]; then
+            { echo '### 빌드 실패 — build.log 마지막 80줄'; echo '```'; tail -n 80 out/build.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 실패 시 전체 로그 업로드
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: out/build.log
+          if-no-files-found: ignore
+
+      - name: 릴리스용 파일 준비 (2GB 제한 때문에 조각으로 나눔)
+        run: |
+          cd out
+          sha256sum codeos.iso > codeos.iso.sha256
+          split -b 1900M -d -a 2 codeos.iso codeos.iso.part
+          rm codeos.iso
+          cp "$PROJ/join-iso.bat" .
+          ls -lh
+
+      - name: 비공개(Draft) 릴리스로 업로드
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="iso-${{ github.run_number }}"
+          cat > notes.md <<'NOTES'
+          ## CodeOS ISO
+          1. 아래 파일을 **전부** 같은 폴더에 다운로드 (`codeos.iso.part00`, `part01`, … / `codeos.iso.sha256` / `join-iso.bat`)
+          2. `join-iso.bat` 더블클릭 → `codeos.iso` 생성
+          3. VirtualBox 에 연결해서 부팅 (사용자 `dev` / 비밀번호 `live`)
+
+          ⚠️ 이 ISO 에는 Google Chrome 과 VS Code(Microsoft) 가 들어 있습니다. 개인 사용용이며, **Publish 해서 공개하지 마세요** (재배포 라이선스 문제).
+          NOTES
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "CodeOS ISO (build ${{ github.run_number }})" --notes-file notes.md
+          for f in out/codeos.iso.part* out/codeos.iso.sha256 out/join-iso.bat; do
+            ok=0
+            for i in 1 2 3; do
+              if gh release upload "$TAG" "$f" --clobber; then ok=1; break; fi
+              echo "업로드 재시도 ($i): $f"; sleep 20
+            done
+            [ "$ok" = 1 ] || { echo "::error::업로드 실패: $f"; exit 1; }
+          done
+          echo "### ✅ 빌드 완료" >> "$GITHUB_STEP_SUMMARY"
+          echo "저장소 → **Releases** 에서 Draft 릴리스 \`$TAG\` 의 파일을 모두 내려받으세요." >> "$GITHUB_STEP_SUMMARY"
